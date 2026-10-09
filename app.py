@@ -10,7 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import psycopg
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 
 def db():
