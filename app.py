@@ -21,7 +21,7 @@ from auth import DUMMY_PASSWORD_HASH, hash_password, normalize_email, session_di
 VERSION = "1.0.0"
 SESSION_TTL = timedelta(days=7)
 SESSION_COOKIE = "shop_session"
-MAX_AUTH_BODY = 4096
+MAX_AUTH_BODY = 8192
 logger = logging.getLogger(__name__)
 
 
@@ -76,19 +76,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/auth/login", "/api/auth/logout"):
+        if path not in ("/api/auth/login", "/api/auth/register", "/api/auth/logout"):
             self.send_json(404, {"error": "not found"})
             return
         if not self.authorize_browser_origin():
             return
         if path == "/api/auth/login":
             self.handle_auth_login()
+        elif path == "/api/auth/register":
+            self.handle_auth_register()
         else:
             self.handle_auth_logout()
 
     def do_OPTIONS(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/auth/login", "/api/auth/logout", "/api/auth/session"):
+        if path not in (
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/auth/logout",
+            "/api/auth/session",
+        ):
             self.send_json(204, None)
             return
         if not self.browser_origin_matches():
@@ -191,25 +198,73 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Invalid email or password"}, auth=True)
                     return
 
-                token = secrets.token_urlsafe(32)
-                expires_at = datetime.now(timezone.utc) + SESSION_TTL
-                conn.execute(
-                    "INSERT INTO customer_sessions (token_hash, customer_id, expires_at) "
-                    "VALUES (%s, %s, %s)",
-                    (session_digest(token), customer[0], expires_at),
-                )
-            self.send_json(
-                200,
-                {
-                    "authenticated": True,
-                    "customer": {"id": customer[0], "email": customer[1]},
-                },
-                auth=True,
-                cookie=token,
-            )
+                token = self.issue_session(conn, customer[0])
+            self.send_authenticated_customer(customer, token)
         except Exception:
             logger.exception("Customer login failed")
             self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
+    def handle_auth_register(self):
+        payload = self.request_json()
+        if payload is None:
+            self.send_json(400, {"error": "Expected a JSON email and password"}, auth=True)
+            return
+        email = payload.get("email")
+        password = payload.get("password")
+        if (
+            not valid_email(email)
+            or not isinstance(password, str)
+            or len(password) < 12
+            or len(password) > 1024
+        ):
+            self.send_json(
+                400,
+                {"error": "Enter a valid email and a password with at least 12 characters"},
+                auth=True,
+            )
+            return
+
+        try:
+            email = normalize_email(email)
+            with db() as conn:
+                customer = conn.execute(
+                    "INSERT INTO customers (email, password_hash) VALUES (%s, %s) "
+                    "ON CONFLICT (email) DO NOTHING RETURNING id, email",
+                    (email, hash_password(password)),
+                ).fetchone()
+                if not customer:
+                    self.send_json(
+                        409,
+                        {"error": "An account with this email already exists"},
+                        auth=True,
+                    )
+                    return
+                token = self.issue_session(conn, customer[0])
+            self.send_authenticated_customer(customer, token)
+        except Exception:
+            logger.exception("Customer registration failed")
+            self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
+    def issue_session(self, conn, customer_id):
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + SESSION_TTL
+        conn.execute(
+            "INSERT INTO customer_sessions (token_hash, customer_id, expires_at) "
+            "VALUES (%s, %s, %s)",
+            (session_digest(token), customer_id, expires_at),
+        )
+        return token
+
+    def send_authenticated_customer(self, customer, token):
+        self.send_json(
+            200,
+            {
+                "authenticated": True,
+                "customer": {"id": customer[0], "email": customer[1]},
+            },
+            auth=True,
+            cookie=token,
+        )
 
     def request_cookie(self):
         try:

@@ -45,6 +45,11 @@ class FakeDatabase:
     def execute(self, query, params=()):
         if "FROM customers WHERE email" in query:
             return FakeCursor(self.customer if params[0] == self.customer[1] else None)
+        if query.startswith("INSERT INTO customers"):
+            if self.customer and params[0] == self.customer[1]:
+                return FakeCursor()
+            self.customer = (8, params[0], params[1])
+            return FakeCursor((self.customer[0], self.customer[1]))
         if query.startswith("INSERT INTO customer_sessions"):
             self.sessions[params[0]] = (params[1], params[2])
             return FakeCursor()
@@ -98,6 +103,22 @@ class CustomerAuthTests(unittest.TestCase):
             body = response.read()
             return response.status, response.headers, json.loads(body) if body else None
 
+    def test_registration_preflight_allows_browser_json_request(self):
+        request = Request(
+            self.base_url + "/api/auth/register",
+            headers={
+                "Origin": WEB_ORIGIN,
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "content-type",
+            },
+            method="OPTIONS",
+        )
+        with urlopen(request, timeout=2) as response:
+            self.assertEqual(response.status, 204)
+            self.assertEqual(response.headers["Access-Control-Allow-Origin"], WEB_ORIGIN)
+            self.assertEqual(response.headers["Access-Control-Allow-Credentials"], "true")
+            self.assertIn("POST", response.headers["Access-Control-Allow-Methods"])
+
     def test_password_hash_is_salted_and_verified(self):
         first = hash_password("correct horse battery")
         second = hash_password("correct horse battery")
@@ -129,6 +150,33 @@ class CustomerAuthTests(unittest.TestCase):
         self.assertEqual(session_status, 200)
         self.assertEqual(session["customer"], body["customer"])
 
+    def test_successful_registration_creates_account_and_signs_customer_in(self):
+        status, headers, body = self.request(
+            "/api/auth/register",
+            method="POST",
+            payload={"email": "NEW-CUSTOMER@example.com", "password": "long secure password"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {
+            "authenticated": True,
+            "customer": {"id": 8, "email": "new-customer@example.com"},
+        })
+        self.assertNotEqual(self.database.customer[2], "long secure password")
+        self.assertTrue(verify_password("long secure password", self.database.customer[2]))
+        self.assertIn("HttpOnly", headers["Set-Cookie"])
+        self.assertIn("Secure", headers["Set-Cookie"])
+        self.assertIn("SameSite=None", headers["Set-Cookie"])
+
+    def test_registration_rejects_duplicate_email(self):
+        status, _, body = self.request(
+            "/api/auth/register",
+            method="POST",
+            payload={"email": "CUSTOMER@example.com", "password": "long secure password"},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(body, {"error": "An account with this email already exists"})
+        self.assertEqual(self.database.sessions, {})
+
     def test_invalid_credentials_are_generic_and_do_not_create_session(self):
         status, _, body = self.request(
             "/api/auth/login",
@@ -147,6 +195,19 @@ class CustomerAuthTests(unittest.TestCase):
         )
         self.assertEqual(status, 400)
         self.assertEqual(body, {"error": "Expected a valid email and password"})
+        self.assertEqual(self.database.sessions, {})
+
+    def test_registration_requires_a_long_password(self):
+        status, _, body = self.request(
+            "/api/auth/register",
+            method="POST",
+            payload={"email": "new@example.com", "password": "short"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            body,
+            {"error": "Enter a valid email and a password with at least 12 characters"},
+        )
         self.assertEqual(self.database.sessions, {})
 
     def test_logout_revokes_the_session(self):
