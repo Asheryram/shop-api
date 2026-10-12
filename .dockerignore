@@ -1,6 +1,6 @@
 .git
 .github
-.deploy
+.infradeploy
 __pycache__
 *.pyc
 .env
