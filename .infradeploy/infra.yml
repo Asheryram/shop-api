@@ -1,0 +1,24 @@
+# How the infra platform runs this repo. One entry per independently deployed service.
+name: shop-api
+
+services:
+  # Backend → api-shop-api.<domain> (previews: api-shop-api-pr-N.<domain>)
+  api:
+    # On a real server with GitHub: ghcr.io/<owner>/shop-api — locally: images are built on the server itself.
+    image: local/shop-api
+    port: 8080
+    health_path: /health
+
+    # A feature that needs a secret? Declare it here in the same PR — the deploy waits until DevOps sets it.
+    required_env: []
+    #  - PAYMENT_API_KEY
+
+    # Declared, not created: open the environment in the console → Database → "Create database".
+    # The URL is then injected as DATABASE_URL on the next deploy.
+    databases:
+      - inject_as: DATABASE_URL
+
+# Runs in a one-off container before rollout (once the database has been created).
+migrate:
+  service: api
+  cmd: python migrate.py
