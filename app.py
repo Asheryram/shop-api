@@ -192,13 +192,23 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT id, email, password_hash FROM customers WHERE email = %s",
                     (email,),
                 ).fetchone()
-                password_hash = customer[2] if customer else DUMMY_PASSWORD_HASH
+                
+                # FIXED: Check if customer exists before attempting to access tuple indexes
+                if customer:
+                    # Fallback handles standard positional tuples or dict-like records securely
+                    password_hash = customer[2] if isinstance(customer, (tuple, list)) else customer.get("password_hash")
+                else:
+                    password_hash = DUMMY_PASSWORD_HASH
+
                 password_ok = verify_password(password, password_hash)
                 if not customer or not password_ok:
                     self.send_json(401, {"error": "Invalid email or password"}, auth=True)
                     return
 
-                token = self.issue_session(conn, customer[0])
+                # FIXED: Extract ID safely depending on row type format
+                customer_id = customer[0] if isinstance(customer, (tuple, list)) else customer.get("id")
+                token = self.issue_session(conn, customer_id)
+                
             self.send_authenticated_customer(customer, token)
         except Exception:
             logger.exception("Customer login failed")
@@ -232,6 +242,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ON CONFLICT (email) DO NOTHING RETURNING id, email",
                     (email, hash_password(password)),
                 ).fetchone()
+                
                 if not customer:
                     self.send_json(
                         409,
@@ -239,11 +250,16 @@ class Handler(BaseHTTPRequestHandler):
                         auth=True,
                     )
                     return
-                token = self.issue_session(conn, customer[0])
+                
+                # FIXED: Extract ID safely depending on row type format
+                customer_id = customer[0] if isinstance(customer, (tuple, list)) else customer.get("id")
+                token = self.issue_session(conn, customer_id)
+                
             self.send_authenticated_customer(customer, token)
         except Exception:
             logger.exception("Customer registration failed")
             self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
 
     def issue_session(self, conn, customer_id):
         token = secrets.token_urlsafe(32)
