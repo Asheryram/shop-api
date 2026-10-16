@@ -1,3 +1,4 @@
+\
 """shop-api — a tiny product API backed by Postgres.
 
 GET /health          liveness for the platform
@@ -32,10 +33,10 @@ def db():
 def info():
     try:
         with db() as conn:
-            name = conn.execute("SELECT current_database()").fetchone()[0]
+            name = conn.execute("SELECT current_database()").fetchone()
         database = {"ok": True, "name": name}
     except Exception as e:
-        database = {"ok": False, "error": str(e).splitlines()[0]}
+        database = {"ok": False, "error": str(e).splitlines()}
     return {
         "service": "shop-api",
         "version": VERSION,
@@ -49,7 +50,7 @@ def info():
 def products():
     with db() as conn:
         rows = conn.execute("SELECT id, name, price FROM products ORDER BY id").fetchall()
-    return [{"id": r[0], "name": r[1], "price": float(r[2])} for r in rows]
+    return [{"id": r, "name": r, "price": float(r)} for r in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -71,7 +72,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 body, code = {"error": "not found"}, 404
         except Exception as e:
-            body, code = {"error": str(e).splitlines()[0]}, 500
+            body, code = {"error": str(e).splitlines()}, 500
         self.send_json(code, body)
 
     def do_POST(self):
@@ -193,10 +194,8 @@ class Handler(BaseHTTPRequestHandler):
                     (email,),
                 ).fetchone()
                 
-                # FIXED: Check if customer exists before attempting to access tuple indexes
                 if customer:
-                    # Fallback handles standard positional tuples or dict-like records securely
-                    password_hash = customer[2] if isinstance(customer, (tuple, list)) else customer.get("password_hash")
+                    password_hash = customer[2]
                 else:
                     password_hash = DUMMY_PASSWORD_HASH
 
@@ -205,8 +204,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json(401, {"error": "Invalid email or password"}, auth=True)
                     return
 
-                # FIXED: Extract ID safely depending on row type format
-                customer_id = customer[0] if isinstance(customer, (tuple, list)) else customer.get("id")
+                customer_id = customer[0]
+                
+            with db() as conn:
                 token = self.issue_session(conn, customer_id)
                 
             self.send_authenticated_customer(customer, token)
@@ -251,15 +251,15 @@ class Handler(BaseHTTPRequestHandler):
                     )
                     return
                 
-                # FIXED: Extract ID safely depending on row type format
-                customer_id = customer[0] if isinstance(customer, (tuple, list)) else customer.get("id")
+                customer_id = customer[0]
+                
+            with db() as conn:
                 token = self.issue_session(conn, customer_id)
                 
             self.send_authenticated_customer(customer, token)
         except Exception:
             logger.exception("Customer registration failed")
             self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
-
 
     def issue_session(self, conn, customer_id):
         token = secrets.token_urlsafe(32)
