@@ -5,12 +5,24 @@ GET /                where am I running? (env, branch, version, database)
 GET /api/products    products from this environment's own database
 """
 import json
+import logging
 import os
+import re
+import secrets
+from datetime import datetime, timedelta, timezone
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import psycopg
 
+from auth import DUMMY_PASSWORD_HASH, hash_password, normalize_email, session_digest, valid_email, verify_password
+
 VERSION = "1.0.0"
+SESSION_TTL = timedelta(days=7)
+SESSION_COOKIE = "shop_session"
+MAX_AUTH_BODY = 8192
+logger = logging.getLogger(__name__)
 
 
 def db():
@@ -45,24 +57,294 @@ class Handler(BaseHTTPRequestHandler):
         print(f"{self.address_string()} {fmt % args}", flush=True)   # stdout → platform logs
 
     def do_GET(self):
+        path = urlsplit(self.path).path
+        if path == "/api/auth/session":
+            self.handle_auth_session()
+            return
         try:
-            if self.path == "/health":
+            if path == "/health":
                 body, code = {"ok": True}, 200
-            elif self.path == "/":
+            elif path == "/":
                 body, code = info(), 200
-            elif self.path == "/api/products":
+            elif path == "/api/products":
                 body, code = products(), 200
             else:
                 body, code = {"error": "not found"}, 404
         except Exception as e:
             body, code = {"error": str(e).splitlines()[0]}, 500
-        data = json.dumps(body).encode()
+        self.send_json(code, body)
+
+    def do_POST(self):
+        path = urlsplit(self.path).path
+        if path not in ("/api/auth/login", "/api/auth/register", "/api/auth/logout"):
+            self.send_json(404, {"error": "not found"})
+            return
+        if not self.authorize_browser_origin():
+            return
+        if path == "/api/auth/login":
+            self.handle_auth_login()
+        elif path == "/api/auth/register":
+            self.handle_auth_register()
+        else:
+            self.handle_auth_logout()
+
+    def do_OPTIONS(self):
+        path = urlsplit(self.path).path
+        if path not in (
+            "/api/auth/login",
+            "/api/auth/register",
+            "/api/auth/logout",
+            "/api/auth/session",
+        ):
+            self.send_json(204, None)
+            return
+        if not self.browser_origin_matches():
+            self.send_json(403, {"error": "origin not allowed"}, auth=True)
+            return
+        self.send_response(204)
+        self.add_auth_cors_headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def request_origin(self):
+        """The origin the browser addressed this request to (the platform's proxy passes X-Forwarded-Host/Proto)."""
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").split(",")[0].strip()
+        proto = (self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        return f"{proto}://{host}" if host else ""
+
+    def browser_origin_matches(self):
+        """May this browser request use the cookie session?  Two cases, both safe against cross-site requests:
+        - the frontend is another origin and is named in WEB_ORIGIN (the original cross-origin setup), or
+        - the page was served from the very address this request goes to (the platform can serve this API under the
+          frontend's own address): the browser then sends Origin equal to that address, or, for a same-origin GET,
+          no Origin but Sec-Fetch-Site: same-origin. A request from any other site carries its own Origin and is refused."""
+        origin = self.headers.get("Origin", "").rstrip("/")
+        configured = os.environ.get("WEB_ORIGIN", "").rstrip("/")
+        if configured and origin == configured:
+            return True
+        if origin:
+            return origin == self.request_origin()
+        return self.headers.get("Sec-Fetch-Site") == "same-origin"
+
+    def authorize_browser_origin(self):
+        if self.browser_origin_matches():
+            return True
+        self.send_json(403, {"error": "origin not allowed"}, auth=True)
+        return False
+
+    def add_auth_cors_headers(self):
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if origin:                                   # same-origin requests need no CORS headers
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
+
+    def send_json(self, code, body, auth=False, cookie=None, clear_cookie=False):
+        data = b"" if body is None else json.dumps(body).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")   # demo: any frontend preview may call us
+        if auth:
+            if self.browser_origin_matches():
+                self.add_auth_cors_headers()
+            self.send_header("Cache-Control", "no-store")
+        else:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        if cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"{SESSION_COOKIE}={cookie}; Path=/; Max-Age={int(SESSION_TTL.total_seconds())}; "
+                "HttpOnly; Secure; SameSite=None",
+            )
+        elif clear_cookie:
+            self.send_header(
+                "Set-Cookie",
+                f"{SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=None",
+            )
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if data:
+            self.wfile.write(data)
+
+    def request_json(self):
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError:
+            return None
+        if content_length <= 0 or content_length > MAX_AUTH_BODY:
+            return None
+        if self.headers.get_content_type() != "application/json":
+            return None
+        try:
+            body = json.loads(self.rfile.read(content_length))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+        return body if isinstance(body, dict) else None
+
+    def handle_auth_login(self):
+        payload = self.request_json()
+        if payload is None:
+            self.send_json(400, {"error": "Expected a JSON email and password"}, auth=True)
+            return
+        email = payload.get("email")
+        password = payload.get("password")
+        if (
+            not valid_email(email)
+            or not isinstance(password, str)
+            or not password
+            or len(password) > 1024
+        ):
+            self.send_json(400, {"error": "Expected a valid email and password"}, auth=True)
+            return
+
+        try:
+            email = normalize_email(email)
+            with db() as conn:
+                customer = conn.execute(
+                    "SELECT id, email, password_hash FROM customers WHERE email = %s",
+                    (email,),
+                ).fetchone()
+                
+                if customer:
+                    password_hash = customer[2]
+                else:
+                    password_hash = DUMMY_PASSWORD_HASH
+
+                password_ok = verify_password(password, password_hash)
+                if not customer or not password_ok:
+                    self.send_json(401, {"error": "Invalid email or password"}, auth=True)
+                    return
+
+                customer_id = customer[0]
+                
+            with db() as conn:
+                token = self.issue_session(conn, customer_id)
+                
+            self.send_authenticated_customer(customer, token)
+        except Exception:
+            logger.exception("Customer login failed")
+            self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
+    def handle_auth_register(self):
+        payload = self.request_json()
+        if payload is None:
+            self.send_json(400, {"error": "Expected a JSON email and password"}, auth=True)
+            return
+        email = payload.get("email")
+        password = payload.get("password")
+        if (
+            not valid_email(email)
+            or not isinstance(password, str)
+            or len(password) < 12
+            or len(password) > 1024
+        ):
+            self.send_json(
+                400,
+                {"error": "Enter a valid email and a password with at least 12 characters"},
+                auth=True,
+            )
+            return
+
+        try:
+            email = normalize_email(email)
+            with db() as conn:
+                customer = conn.execute(
+                    "INSERT INTO customers (email, password_hash) VALUES (%s, %s) "
+                    "ON CONFLICT (email) DO NOTHING RETURNING id, email",
+                    (email, hash_password(password)),
+                ).fetchone()
+                
+                if not customer:
+                    self.send_json(
+                        409,
+                        {"error": "An account with this email already exists"},
+                        auth=True,
+                    )
+                    return
+                
+                customer_id = customer[0]
+                
+            with db() as conn:
+                token = self.issue_session(conn, customer_id)
+                
+            self.send_authenticated_customer(customer, token)
+        except Exception:
+            logger.exception("Customer registration failed")
+            self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
+    def issue_session(self, conn, customer_id):
+        token = secrets.token_urlsafe(32)
+        expires_at = datetime.now(timezone.utc) + SESSION_TTL
+        conn.execute(
+            "INSERT INTO customer_sessions (token_hash, customer_id, expires_at) "
+            "VALUES (%s, %s, %s)",
+            (session_digest(token), customer_id, expires_at),
+        )
+        return token
+
+    def send_authenticated_customer(self, customer, token):
+        self.send_json(
+            200,
+            {
+                "authenticated": True,
+                "customer": {"id": customer[0], "email": customer[1]},
+            },
+            auth=True,
+            cookie=token,
+        )
+
+    def request_cookie(self):
+        try:
+            cookies = SimpleCookie(self.headers.get("Cookie", ""))
+            return cookies[SESSION_COOKIE].value if SESSION_COOKIE in cookies else None
+        except (KeyError, ValueError):
+            return None
+
+    def handle_auth_session(self):
+        if not self.authorize_browser_origin():
+            return
+        token = self.request_cookie()
+        if not token or not re.fullmatch(r"[A-Za-z0-9_-]{40,}", token):
+            self.send_json(200, {"authenticated": False}, auth=True, clear_cookie=bool(token))
+            return
+        try:
+            with db() as conn:
+                customer = conn.execute(
+                    "SELECT c.id, c.email FROM customer_sessions s "
+                    "JOIN customers c ON c.id = s.customer_id "
+                    "WHERE s.token_hash = %s AND s.expires_at > %s",
+                    (session_digest(token), datetime.now(timezone.utc)),
+                ).fetchone()
+            if not customer:
+                self.send_json(200, {"authenticated": False}, auth=True, clear_cookie=True)
+                return
+            self.send_json(
+                200,
+                {
+                    "authenticated": True,
+                    "customer": {"id": customer[0], "email": customer[1]},
+                },
+                auth=True,
+            )
+        except Exception:
+            logger.exception("Customer session lookup failed")
+            self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
+
+    def handle_auth_logout(self):
+        token = self.request_cookie()
+        try:
+            if token and re.fullmatch(r"[A-Za-z0-9_-]{40,}", token):
+                with db() as conn:
+                    conn.execute(
+                        "DELETE FROM customer_sessions WHERE token_hash = %s",
+                        (session_digest(token),),
+                    )
+            self.send_json(200, {"authenticated": False}, auth=True, clear_cookie=True)
+        except Exception:
+            logger.exception("Customer logout failed")
+            self.send_json(503, {"error": "Authentication service unavailable"}, auth=True)
 
 
 if __name__ == "__main__":

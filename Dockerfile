@@ -2,7 +2,7 @@ FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PORT=8080
 WORKDIR /app
 RUN pip install --no-cache-dir "psycopg[binary]==3.2.*" && useradd --uid 10001 app
-COPY app.py migrate.py ./
+COPY app.py auth.py create_customer.py migrate.py ./
 USER app
 EXPOSE 8080
 # The platform waits for this before calling a deploy successful.
