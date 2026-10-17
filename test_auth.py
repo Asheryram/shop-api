@@ -226,5 +226,78 @@ class CustomerAuthTests(unittest.TestCase):
         self.assertEqual(self.database.sessions, {})
 
 
+class SameOriginTests(unittest.TestCase):
+    """The API served under the frontend's own address (no WEB_ORIGIN configured at all)."""
+
+    FRONT = "shop-web-pr-1.example.test"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.server = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.port = cls.server.server_port
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        cls.thread.join()
+
+    def setUp(self):
+        self.database = FakeDatabase()
+        for p in (patch("app.db", return_value=self.database), patch.dict(os.environ, {}, clear=False)):
+            p.start()
+            self.addCleanup(p.stop)
+        os.environ.pop("WEB_ORIGIN", None)
+
+    def call(self, method, path, headers=None, payload=None):
+        h = {"X-Forwarded-Host": self.FRONT, "X-Forwarded-Proto": "https"}
+        h.update(headers or {})
+        body = None
+        if payload is not None:
+            body = json.dumps(payload)
+            h["Content-Type"] = "application/json"
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
+        conn.request(method, path, body=body, headers=h)
+        r = conn.getresponse()
+        raw = r.read()
+        conn.close()
+        return r.status, r, json.loads(raw) if raw else None
+
+    def test_same_origin_session_check_without_origin_header(self):
+        status, _, body = self.call("GET", "/api/auth/session", {"Sec-Fetch-Site": "same-origin"})
+        self.assertEqual((status, body), (200, {"authenticated": False}))
+
+    def test_same_origin_login_works_without_web_origin_configured(self):
+        status, response, body = self.call(
+            "POST", "/api/auth/login", {"Origin": "https://" + self.FRONT},
+            {"email": "customer@example.com", "password": "correct horse battery"})
+        self.assertEqual(status, 200)
+        self.assertTrue(body["authenticated"])
+        self.assertIn("HttpOnly", response.getheader("Set-Cookie"))
+        self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "https://" + self.FRONT)
+
+    def test_another_site_is_refused(self):
+        for headers in ({"Origin": "https://evil.example"}, {"Origin": "null"}, {}, {"Sec-Fetch-Site": "cross-site"}):
+            status, _, body = self.call("POST", "/api/auth/login", headers,
+                                        {"email": "customer@example.com", "password": "correct horse battery"})
+            self.assertEqual((status, body), (403, {"error": "origin not allowed"}), headers)
+        self.assertEqual(self.database.sessions, {})
+
+    def test_session_check_from_another_site_is_refused(self):
+        status, _, _ = self.call("GET", "/api/auth/session", {"Origin": "https://evil.example"})
+        self.assertEqual(status, 403)
+
+    def test_a_configured_cross_origin_frontend_still_works(self):
+        os.environ["WEB_ORIGIN"] = "https://shop.example.com"
+        status, response, body = self.call(
+            "POST", "/api/auth/login", {"Origin": "https://shop.example.com"},
+            {"email": "customer@example.com", "password": "correct horse battery"})
+        self.assertEqual(status, 200)
+        self.assertEqual(response.getheader("Access-Control-Allow-Origin"), "https://shop.example.com")
+        self.assertEqual(response.getheader("Access-Control-Allow-Credentials"), "true")
+
+
 if __name__ == "__main__":
     unittest.main()

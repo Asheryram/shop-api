@@ -109,24 +109,38 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def request_origin(self):
+        """The origin the browser addressed this request to (the platform's proxy passes X-Forwarded-Host/Proto)."""
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").split(",")[0].strip()
+        proto = (self.headers.get("X-Forwarded-Proto") or "https").split(",")[0].strip()
+        return f"{proto}://{host}" if host else ""
+
     def browser_origin_matches(self):
-        configured = os.environ.get("WEB_ORIGIN", "").rstrip("/")
+        """May this browser request use the cookie session?  Two cases, both safe against cross-site requests:
+        - the frontend is another origin and is named in WEB_ORIGIN (the original cross-origin setup), or
+        - the page was served from the very address this request goes to (the platform can serve this API under the
+          frontend's own address): the browser then sends Origin equal to that address, or, for a same-origin GET,
+          no Origin but Sec-Fetch-Site: same-origin. A request from any other site carries its own Origin and is refused."""
         origin = self.headers.get("Origin", "").rstrip("/")
-        return bool(configured and origin and origin == configured)
+        configured = os.environ.get("WEB_ORIGIN", "").rstrip("/")
+        if configured and origin == configured:
+            return True
+        if origin:
+            return origin == self.request_origin()
+        return self.headers.get("Sec-Fetch-Site") == "same-origin"
 
     def authorize_browser_origin(self):
-        if not os.environ.get("WEB_ORIGIN"):
-            self.send_json(503, {"error": "Authentication is not configured"}, auth=True)
-            return False
-        if not self.browser_origin_matches():
-            self.send_json(403, {"error": "origin not allowed"}, auth=True)
-            return False
-        return True
+        if self.browser_origin_matches():
+            return True
+        self.send_json(403, {"error": "origin not allowed"}, auth=True)
+        return False
 
     def add_auth_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", os.environ["WEB_ORIGIN"].rstrip("/"))
-        self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Vary", "Origin")
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if origin:                                   # same-origin requests need no CORS headers
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Vary", "Origin")
 
     def send_json(self, code, body, auth=False, cookie=None, clear_cookie=False):
         data = b"" if body is None else json.dumps(body).encode("utf-8")
