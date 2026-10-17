@@ -1,4 +1,3 @@
-\
 """shop-api — a tiny product API backed by Postgres.
 
 GET /health          liveness for the platform
@@ -33,10 +32,10 @@ def db():
 def info():
     try:
         with db() as conn:
-            name = conn.execute("SELECT current_database()").fetchone()
+            name = conn.execute("SELECT current_database()").fetchone()[0]
         database = {"ok": True, "name": name}
     except Exception as e:
-        database = {"ok": False, "error": str(e).splitlines()}
+        database = {"ok": False, "error": str(e).splitlines()[0]}
     return {
         "service": "shop-api",
         "version": VERSION,
@@ -50,7 +49,7 @@ def info():
 def products():
     with db() as conn:
         rows = conn.execute("SELECT id, name, price FROM products ORDER BY id").fetchall()
-    return [{"id": r, "name": r, "price": float(r)} for r in rows]
+    return [{"id": r[0], "name": r[1], "price": float(r[2])} for r in rows]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -72,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 body, code = {"error": "not found"}, 404
         except Exception as e:
-            body, code = {"error": str(e).splitlines()}, 500
+            body, code = {"error": str(e).splitlines()[0]}, 500
         self.send_json(code, body)
 
     def do_POST(self):
